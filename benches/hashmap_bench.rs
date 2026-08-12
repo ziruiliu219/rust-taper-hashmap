@@ -7,6 +7,10 @@
 //!   - 1col_i64:  单列 i64 key (8B)
 //!   - 2col_i64:  两列 i64 key (16B)
 //!   - 4col_i64:  四列 i64 key (32B)
+//!   - 4str_0int: 4 varchar + 0 int key
+//!   - 3str_1int: 3 varchar + 1 int key
+//!   - 2str_2int: 2 varchar + 2 int key
+//!   - 1str_3int: 1 varchar + 3 int key
 //!
 //! 参数:
 //!   - HT size: 256, 1024, 4096, 16384
@@ -17,12 +21,8 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use hashbrown::{HashMap, hash_map::RawEntryMut};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use taper_hashmap::batch_compare::{compare_i64, compare_i32};
-use taper_hashmap::chunk::SlotValue;
-use taper_hashmap::row_container::RowContainer;
-use taper_hashmap::taper_hashmap::TaperHashMap;
+use taper_hashmap::column_marshaller::{TaperColumnSerializeHandler, ColumnDesc, ColumnInput};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
-use arrow::array::Int64Array as ArrowInt64Array;
 
 // ═══════════════════════════════════════════════════════════════════
 // Daft infra
@@ -48,72 +48,60 @@ impl Hash for IndexHash {
 // ═══════════════════════════════════════════════════════════════════
 
 #[inline]
-fn hash_i64(val: i64) -> u64 {
-    xxh3_64_with_seed(&val.to_le_bytes(), 0)
-}
-
-#[inline]
-fn hash_i32(val: i32) -> u64 {
-    xxh3_64_with_seed(&val.to_le_bytes(), 0)
-}
-
-#[inline]
 fn hash_combine(seed: u64, val: i64) -> u64 {
     xxh3_64_with_seed(&val.to_le_bytes(), seed)
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Key type abstraction
-// ═══════════════════════════════════════════════════════════════════
-
-/// Precomputed benchmark data for a given key type configuration.
-struct BenchData {
-    /// Key columns as i64 Vecs (used by Taper side for RowContainer writes).
-    keys: Vec<Vec<i64>>,
-    /// Key columns as Arrow Int64Array (used by Daft side for comparator).
-    arrow_keys: Vec<ArrowInt64Array>,
-    hashes: Vec<u64>,
-    values: Vec<i64>,
-    num_cols: usize,
-    col_size: usize, // bytes per key column in RowContainer
+#[inline]
+fn hash_bytes(data: &[u8], seed: u64) -> u64 {
+    xxh3_64_with_seed(data, seed)
 }
 
-/// Generate build+probe data for a given key type configuration.
-fn generate_data(
-    num_cols: usize,
-    col_size: usize, // 4 for i32, 8 for i64
+// ═══════════════════════════════════════════════════════════════════
+// Mixed (varchar + int) key benchmark data
+// ═══════════════════════════════════════════════════════════════════
+
+struct MixedBenchData {
+    /// String columns data (each element is a Vec of byte strings)
+    str_cols: Vec<Vec<Vec<u8>>>,
+    /// Int columns data
+    int_cols: Vec<Vec<i64>>,
+    hashes: Vec<u64>,
+    values: Vec<i64>,
+    num_str_cols: usize,
+    num_int_cols: usize,
+}
+
+/// Generate random string of given average length
+fn gen_string(_rng: &mut StdRng, base: &str, id: usize, col: usize) -> Vec<u8> {
+    format!("{}_{}_c{}", base, id, col).into_bytes()
+}
+
+fn generate_mixed_data(
+    num_str_cols: usize,
+    num_int_cols: usize,
     num_keys: usize,
     num_probe_rows: usize,
     selectivity: f64,
     rng: &mut StdRng,
-) -> BenchData {
-    // Build keys: each column is deterministic
-    let mut build_cols: Vec<Vec<i64>> = Vec::with_capacity(num_cols);
-    for c in 0..num_cols {
-        let col: Vec<i64> = (0..num_keys)
-            .map(|i| i as i64 * (97 + c as i64 * 31) + 1 + c as i64)
-            .collect();
-        build_cols.push(col);
-    }
+) -> MixedBenchData {
+    // Build keys
+    let mut build_str_cols: Vec<Vec<Vec<u8>>> = (0..num_str_cols)
+        .map(|c| (0..num_keys).map(|i| gen_string(rng, "key", i, c)).collect())
+        .collect();
+    let mut build_int_cols: Vec<Vec<i64>> = (0..num_int_cols)
+        .map(|c| (0..num_keys).map(|i| i as i64 * (97 + c as i64 * 31) + 1).collect())
+        .collect();
 
     // Build hashes
     let build_hashes: Vec<u64> = (0..num_keys)
         .map(|i| {
             let mut h = 0u64;
-            for c in 0..num_cols {
-                if col_size == 4 {
-                    h = if c == 0 {
-                        hash_i32(build_cols[c][i] as i32)
-                    } else {
-                        hash_combine(h, build_cols[c][i])
-                    };
-                } else {
-                    h = if c == 0 {
-                        hash_i64(build_cols[c][i])
-                    } else {
-                        hash_combine(h, build_cols[c][i])
-                    };
-                }
+            for c in 0..num_str_cols {
+                h = hash_bytes(&build_str_cols[c][i], h);
+            }
+            for c in 0..num_int_cols {
+                h = hash_combine(h, build_int_cols[c][i]);
             }
             h
         })
@@ -122,200 +110,124 @@ fn generate_data(
     let build_values: Vec<i64> = (0..num_keys).map(|i| (i % 1000) as i64).collect();
 
     // Probe keys
-    let num_hits: usize = (num_probe_rows as f64 * selectivity) as usize;
+    let num_hits = (num_probe_rows as f64 * selectivity) as usize;
     let num_misses = num_probe_rows - num_hits;
 
-    let mut probe_cols: Vec<Vec<i64>> = vec![Vec::with_capacity(num_probe_rows); num_cols];
+    let mut probe_str_cols: Vec<Vec<Vec<u8>>> = vec![Vec::with_capacity(num_probe_rows); num_str_cols];
+    let mut probe_int_cols: Vec<Vec<i64>> = vec![Vec::with_capacity(num_probe_rows); num_int_cols];
     let mut probe_hashes: Vec<u64> = Vec::with_capacity(num_probe_rows);
 
-    // Hits: random from build keys
     for _ in 0..num_hits {
         let idx = rng.random_range(0..num_keys);
-        for c in 0..num_cols {
-            probe_cols[c].push(build_cols[c][idx]);
-        }
+        for c in 0..num_str_cols { probe_str_cols[c].push(build_str_cols[c][idx].clone()); }
+        for c in 0..num_int_cols { probe_int_cols[c].push(build_int_cols[c][idx]); }
         probe_hashes.push(build_hashes[idx]);
     }
 
-    // Misses: guaranteed unique keys not in build set
-    let miss_base = (num_keys as i64 + 1) * 200 + 10000;
     for i in 0..num_misses {
         let mut h = 0u64;
-        for c in 0..num_cols {
-            let v = miss_base + i as i64 * (31 + c as i64 * 7) + c as i64 * 3;
-            probe_cols[c].push(v);
-            if col_size == 4 {
-                h = if c == 0 { hash_i32(v as i32) } else { hash_combine(h, v) };
-            } else {
-                h = if c == 0 { hash_i64(v) } else { hash_combine(h, v) };
-            }
+        for c in 0..num_str_cols {
+            let s = format!("miss_{}_{}", i, c).into_bytes();
+            h = hash_bytes(&s, h);
+            probe_str_cols[c].push(s);
+        }
+        for c in 0..num_int_cols {
+            let v = (num_keys as i64 + 1) * 200 + i as i64 * 31 + c as i64;
+            h = hash_combine(h, v);
+            probe_int_cols[c].push(v);
         }
         probe_hashes.push(h);
     }
 
     // Shuffle probe
     let mut order: Vec<usize> = (0..num_probe_rows).collect();
-    for i in (1..num_probe_rows).rev() {
-        order.swap(i, rng.random_range(0..=i));
-    }
-    let probe_cols: Vec<Vec<i64>> = (0..num_cols)
-        .map(|c| order.iter().map(|&i| probe_cols[c][i]).collect())
-        .collect();
+    for i in (1..num_probe_rows).rev() { order.swap(i, rng.random_range(0..=i)); }
+    let mut probe_str_cols: Vec<Vec<Vec<u8>>> = (0..num_str_cols).map(|c| order.iter().map(|&i| probe_str_cols[c][i].clone()).collect()).collect();
+    let probe_int_cols: Vec<Vec<i64>> = (0..num_int_cols).map(|c| order.iter().map(|&i| probe_int_cols[c][i]).collect()).collect();
     let probe_hashes: Vec<u64> = order.iter().map(|&i| probe_hashes[i]).collect();
     let probe_values: Vec<i64> = (0..num_probe_rows).map(|i| (i % 1000) as i64).collect();
 
     // Combine build + probe
-    let mut all_cols: Vec<Vec<i64>> = Vec::with_capacity(num_cols);
-    for c in 0..num_cols {
-        let mut col = build_cols[c].clone();
-        col.extend_from_slice(&probe_cols[c]);
-        all_cols.push(col);
+    for c in 0..num_str_cols {
+        let drain: Vec<Vec<u8>> = std::mem::take(&mut probe_str_cols[c]);
+        build_str_cols[c].extend(drain);
     }
-    let mut all_hashes = build_hashes;
-    all_hashes.extend_from_slice(&probe_hashes);
-    let mut all_values = build_values;
-    all_values.extend_from_slice(&probe_values);
+    for c in 0..num_int_cols { build_int_cols[c].extend_from_slice(&probe_int_cols[c]); }
+    let mut all_hashes = build_hashes; all_hashes.extend_from_slice(&probe_hashes);
+    let mut all_values = build_values; all_values.extend_from_slice(&probe_values);
 
-    BenchData {
-        keys: all_cols.clone(),
-        arrow_keys: all_cols.iter().map(|col| ArrowInt64Array::from(col.clone())).collect(),
+    MixedBenchData {
+        str_cols: build_str_cols,
+        int_cols: build_int_cols,
         hashes: all_hashes,
         values: all_values,
-        num_cols,
-        col_size,
+        num_str_cols,
+        num_int_cols,
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Taper runner (generic over num_cols)
+// Taper runners
 // ═══════════════════════════════════════════════════════════════════
 
 #[inline(never)]
-fn run_taper(data: &BenchData, ht_size: usize) {
-    let key_sizes: Vec<usize> = vec![data.col_size; data.num_cols];
-    let mut rc = RowContainer::new(&key_sizes, 8);
-    rc.reserve(ht_size + 256);
-    let mut map = TaperHashMap::with_capacity(ht_size);
-    let agg_offset = rc.agg_state_offset();
+fn run_taper_mixed(data: &MixedBenchData, ht_size: usize) {
+    // Build schema
+    let mut col_descs: Vec<ColumnDesc> = Vec::new();
+    for _ in 0..data.num_str_cols { col_descs.push(ColumnDesc::Varchar); }
+    for _ in 0..data.num_int_cols { col_descs.push(ColumnDesc::Int64); }
 
-    // Precompute column offsets
-    let col_offsets: Vec<usize> = (0..data.num_cols)
-        .map(|c| rc.column_at(c).offset())
+    let mut table = TaperColumnSerializeHandler::new(&col_descs, 8, ht_size);
+
+    // Build column inputs
+    let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
+        .map(|c| data.str_cols[c].iter().map(|s| s.as_slice()).collect())
         .collect();
 
-    let num_cols = data.num_cols;
-    let col_size = data.col_size;
+    let mut columns: Vec<ColumnInput> = Vec::new();
+    for c in 0..data.num_str_cols {
+        columns.push(ColumnInput::Varchar(&str_slices[c]));
+    }
+    for c in 0..data.num_int_cols {
+        columns.push(ColumnInput::Int64(&data.int_cols[c]));
+    }
 
-    // Batch key comparator using SIMD (batch_compare::compare_i64)
-    // Receives a slice of (row_idx, row_ptr) pairs, returns Vec<bool> of matches.
-    let batch_key_cmp = |pairs: &[(usize, *const u8)]| -> Vec<bool> {
-        if pairs.is_empty() {
-            return Vec::new();
-        }
-
-        let count = pairs.len();
-        let mut results = vec![true; count];
-
-        // For each key column, do batch comparison
-        for c in 0..num_cols {
-            // Build indices/groups arrays for compare_i64
-            let mut indices: Vec<u32> = (0..count as u32).collect();
-            let groups: Vec<*const u8> = pairs.iter().map(|&(_, ptr)| ptr).collect();
-            let input_values: Vec<i64> = pairs.iter().map(|&(row_idx, _)| data.keys[c][row_idx]).collect();
-
-            let offset = col_offsets[c];
-
-            if col_size == 4 {
-                // Use SIMD batch compare for i32 columns
-                let input_i32: Vec<i32> = pairs.iter().map(|&(row_idx, _)| data.keys[c][row_idx] as i32).collect();
-                let num_unequal = compare_i32(
-                    &mut indices, count, &input_i32, &groups, offset,
-                );
-                for i in 0..num_unequal {
-                    results[indices[i] as usize] = false;
-                }
-            } else {
-                // Use SIMD batch compare for i64 columns
-                let num_unequal = compare_i64(
-                    &mut indices, count, &input_values, &groups, offset,
-                );
-                // Mark unequal rows
-                for i in 0..num_unequal {
-                    results[indices[i] as usize] = false;
-                }
-            }
-        }
-
-        results
-    };
-
-    let mut on_init = |i: usize, sv: &mut SlotValue| {
-        let row = rc.new_row();
-        unsafe {
-            for c in 0..num_cols {
-                if col_size == 4 {
-                    (row.add(col_offsets[c]) as *mut i32).write_unaligned(data.keys[c][i] as i32);
-                } else {
-                    (row.add(col_offsets[c]) as *mut i64).write_unaligned(data.keys[c][i]);
-                }
-            }
-            (row.add(agg_offset) as *mut i64).write_unaligned(data.values[i]);
-        }
-        sv.set_ptr(row as *const u8);
-    };
-
-    let mut on_update = |i: usize, sv: &SlotValue, is_new: bool| {
-        if !is_new {
-            let rp = sv.get_ptr() as *mut u8;
-            unsafe { *(rp.add(agg_offset) as *mut i64) += data.values[i]; }
-        }
-    };
-
-    map.emplace_batch_simd(&data.hashes, &batch_key_cmp, &mut on_init, &mut on_update);
-
-    black_box(rc.num_rows());
+    table.emplace_table_with_decode(&data.hashes, &columns, &data.values);
+    black_box(table.num_groups());
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Daft runner (generic over num_cols)
+// Daft runners
 // ═══════════════════════════════════════════════════════════════════
 
 #[inline(never)]
-fn run_daft(data: &BenchData, ht_size: usize) {
-    let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
-        ht_size, Default::default(),
-    );
+fn run_daft_mixed(data: &MixedBenchData, ht_size: usize) {
+    let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(ht_size, Default::default());
     let mut ngroups: u32 = 0;
     let mut sums = Vec::<i64>::with_capacity(ht_size);
-    let num_cols = data.num_cols;
+    let num_str = data.num_str_cols;
+    let num_int = data.num_int_cols;
 
     for (i, &h) in data.hashes.iter().enumerate() {
         let entry = table.raw_entry_mut().from_hash(h, |other| {
-            if h != other.hash {
-                return false;
-            }
+            if h != other.hash { return false; }
             let j = other.idx as usize;
-            // Use Arrow Int64Array::value() — identical to Daft's comparator
-            // which calls arrow array.value(i) == array.value(j)
-            for c in 0..num_cols {
-                if data.arrow_keys[c].value(i) != data.arrow_keys[c].value(j) {
-                    return false;
-                }
+            for c in 0..num_str {
+                if data.str_cols[c][i] != data.str_cols[c][j] { return false; }
+            }
+            for c in 0..num_int {
+                if data.int_cols[c][i] != data.int_cols[c][j] { return false; }
             }
             true
         });
         match entry {
-            RawEntryMut::Occupied(e) => {
-                sums[*e.get() as usize] += data.values[i];
-            }
+            RawEntryMut::Occupied(e) => { sums[*e.get() as usize] += data.values[i]; }
             RawEntryMut::Vacant(e) => {
                 e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, ngroups);
-                ngroups += 1;
-                sums.push(data.values[i]);
+                ngroups += 1; sums.push(data.values[i]);
             }
         }
     }
-
     black_box(&sums);
 }
 
@@ -328,53 +240,31 @@ fn bench_hashagg(c: &mut Criterion) {
     group.sample_size(20);
     let num_probe_rows = 1_000_000;
 
-    // Key type configurations: (name, num_cols, col_size_bytes)
-    let key_types: &[(&str, usize, usize)] = &[
-        ("1col_i32", 1, 4),
-        ("1col_i64", 1, 8),
-        ("2col_i64", 2, 8),
-        ("4col_i64", 4, 8),
+    // ─── Mixed (varchar + int) key types ───
+    // (name, num_str_cols, num_int_cols)
+    let mixed_key_types: &[(&str, usize, usize)] = &[
+        ("4str_0int", 4, 0),
+        ("3str_1int", 3, 1),
+        ("2str_2int", 2, 2),
+        ("1str_3int", 1, 3),
     ];
 
-    for &(type_name, num_cols, col_size) in key_types {
-        for &ht_size in &[256, 1024, 4096, 16384] {
+    for &(type_name, num_str, num_int) in mixed_key_types {
+        for &ht_size in &[16384, 65536, 262144, 1048576] {
             for &load_factor in &[0.5, 0.75] {
                 let num_keys = (ht_size as f64 * load_factor) as usize;
-
-                for &selectivity in &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9] {
+                for &selectivity in &[0.1, 0.3, 0.5, 0.7, 0.9] {
                     let mut rng = StdRng::seed_from_u64(42);
+                    let data = generate_mixed_data(num_str, num_int, num_keys, num_probe_rows, selectivity, &mut rng);
+                    let param = format!("{}_ht={}_lf={:.2}_sel={:.1}", type_name, ht_size, load_factor, selectivity);
 
-                    let data = generate_data(
-                        num_cols, col_size, num_keys,
-                        num_probe_rows, selectivity, &mut rng,
-                    );
-
-                    let param = format!(
-                        "{}_ht={}_lf={:.2}_sel={:.1}",
-                        type_name, ht_size, load_factor, selectivity
-                    );
-
-                    // ─── Daft ───
-                    group.bench_with_input(
-                        BenchmarkId::new("daft", &param),
-                        &data,
-                        |b, d| {
-                            b.iter(|| run_daft(black_box(d), ht_size));
-                        },
-                    );
-
-                    // ─── Taper ───
-                    group.bench_with_input(
-                        BenchmarkId::new("taper", &param),
-                        &data,
-                        |b, d| {
-                            b.iter(|| run_taper(black_box(d), ht_size));
-                        },
-                    );
+                    group.bench_with_input(BenchmarkId::new("daft", &param), &data, |b, d| { b.iter(|| run_daft_mixed(black_box(d), ht_size)); });
+                    group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| { b.iter(|| run_taper_mixed(black_box(d), ht_size)); });
                 }
             }
         }
     }
+
     group.finish();
 }
 

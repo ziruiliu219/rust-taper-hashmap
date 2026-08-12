@@ -2,7 +2,6 @@ use crate::bitmask::BitMask;
 
 const SLOTS_PER_CHUNK: usize = 8;
 const EMPTY_TAG: u8 = 0x80;
-const CHUNK_SIZE: usize = 128;
 
 /// A 128-byte aligned chunk holding 8 slots.
 /// Layout matches C++ TaperHashTableChunk (for Key=u64, Value=6B):
