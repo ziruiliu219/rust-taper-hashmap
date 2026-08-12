@@ -94,7 +94,17 @@ pub fn compare_varchar_from_row(arena_ptr: *const u8, input: &[u8]) -> bool {
         if string_len == 0 { return true; }
         let data_ptr = arena_ptr.add(1 + row_len_size as usize);
         #[cfg(target_arch = "aarch64")]
-        { compare_bytes_neon(data_ptr, input.as_ptr(), string_len) }
+        {
+            #[cfg(debug_assertions)]
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!("[SIMD] compare_varchar_from_row: using NEON (vceqq_u8, 16B/iter)");
+                }
+            }
+            compare_bytes_neon(data_ptr, input.as_ptr(), string_len)
+        }
         #[cfg(not(target_arch = "aarch64"))]
         { std::slice::from_raw_parts(data_ptr, string_len) == input }
     }

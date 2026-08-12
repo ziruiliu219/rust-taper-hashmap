@@ -190,10 +190,14 @@ pub fn batch_compare_decoded_i32(
 ) -> usize {
     #[cfg(target_arch = "aarch64")]
     {
+        #[cfg(debug_assertions)]
+        eprintln!("[SIMD] batch_compare_decoded_i32: using NEON (vceqq_s32, 4×i32/iter)");
         batch_compare_decoded_i32_neon(indices, count, input_values, groups, offset)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(debug_assertions)]
+        eprintln!("[SCALAR] batch_compare_decoded_i32: NEON not available, using scalar");
         batch_compare_decoded_i32_scalar(indices, count, input_values, groups, offset)
     }
 }
@@ -208,10 +212,14 @@ pub fn batch_compare_decoded_i64(
 ) -> usize {
     #[cfg(target_arch = "aarch64")]
     {
+        #[cfg(debug_assertions)]
+        eprintln!("[SIMD] batch_compare_decoded_i64: using NEON (vceqq_s64, 2×i64/iter)");
         batch_compare_decoded_i64_neon(indices, count, input_values, groups, offset)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(debug_assertions)]
+        eprintln!("[SCALAR] batch_compare_decoded_i64: NEON not available, using scalar");
         batch_compare_decoded_i64_scalar(indices, count, input_values, groups, offset)
     }
 }
@@ -416,5 +424,28 @@ mod tests {
 
         assert_eq!(unequals, 1);
         assert_eq!(indices[0], 2);  // row 2 is the unequal one
+    }
+
+    #[test]
+    fn test_simd_dispatch_i64() {
+        // This test goes through the dispatch function to verify SIMD path is used on ARM
+        let mut pool = vec![0u8; 64];
+        unsafe {
+            *(pool.as_mut_ptr().add(0) as *mut i64) = 100;
+            *(pool.as_mut_ptr().add(16) as *mut i64) = 200;
+            *(pool.as_mut_ptr().add(32) as *mut i64) = 300;
+        }
+        let groups: Vec<*const u8> = vec![
+            pool.as_ptr(),
+            unsafe { pool.as_ptr().add(16) },
+            unsafe { pool.as_ptr().add(32) },
+        ];
+        let input_values: Vec<i64> = vec![100, 999, 300]; // row1 mismatch
+        let mut indices: Vec<u32> = vec![0, 1, 2];
+
+        // This calls the dispatch fn which prints SIMD/SCALAR flag in debug mode
+        let unequals = batch_compare_decoded_i64(&mut indices, 3, &input_values, &groups, 0);
+        assert_eq!(unequals, 1);
+        assert_eq!(indices[0], 1);
     }
 }
