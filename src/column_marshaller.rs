@@ -247,11 +247,29 @@ pub fn store_key_one_row_from_decode(
     col_descs: &[ColumnDesc], col_offsets: &[usize],
     varchar_col_indices: &[usize], varchar_slot_col_idx: usize, use_merged: bool,
 ) {
+    // Store varchar columns — matches C++ StoreKeyOneRowFromDecode:
+    // directly iterates varcharColIndices and serializes inline, no temporary array.
     if use_merged && !varchar_col_indices.is_empty() {
-        let values: Vec<Option<&[u8]>> = varchar_col_indices.iter()
-            .map(|&vc_idx| match &columns[vc_idx] { ColumnInput::Varchar(v) => Some(v[row_idx]), _ => panic!("") })
-            .collect();
-        store_merged_varchar_columns(rc, row, varchar_col_indices, varchar_slot_col_idx, &values);
+        // Compute total size
+        let mut total_size = 0usize;
+        for &vc_idx in varchar_col_indices.iter() {
+            let data = match &columns[vc_idx] { ColumnInput::Varchar(v) => v[row_idx], _ => panic!("") };
+            total_size += 1 + compute_row_len_size(data.len()) as usize + data.len();
+        }
+        // Allocate one block
+        let block_start = rc.arena_alloc(total_size);
+        let mut write_pos = block_start;
+        // Serialize each column directly (no Vec allocation)
+        for &vc_idx in varchar_col_indices.iter() {
+            let col = rc.column_at(vc_idx);
+            let data = match &columns[vc_idx] { ColumnInput::Varchar(v) => v[row_idx], _ => panic!("") };
+            RowContainer::clear_null_at(row, col.null_byte(), col.null_mask());
+            let written = serialize_varchar_to_buffer(write_pos, data);
+            write_pos = unsafe { write_pos.add(written) };
+        }
+        // Store pointer in slot column
+        let slot_offset = rc.column_at(varchar_slot_col_idx).offset();
+        unsafe { (row.add(slot_offset) as *mut *const u8).write_unaligned(block_start as *const u8); }
     } else if varchar_col_indices.len() == 1 {
         let vc_idx = varchar_col_indices[0];
         match &columns[vc_idx] {
@@ -259,6 +277,7 @@ pub fn store_key_one_row_from_decode(
             _ => panic!(""),
         }
     }
+    // Store int columns
     for (col_idx, desc) in col_descs.iter().enumerate() {
         if let ColumnDesc::Int64 = desc {
             match &columns[col_idx] {
