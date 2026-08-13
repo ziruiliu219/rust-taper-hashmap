@@ -362,6 +362,9 @@ pub struct TaperColumnSerializeHandler {
     use_merged: bool,
     varchar_col_descs: Vec<(usize, u8)>,
     varchar_slot_col_offset: usize,
+    // Reusable buffers (mirrors C++ class members: workingGroups_, workingUpdateIndices_, etc.)
+    groups: Vec<*const u8>,
+    update_indices: Vec<u32>,
 }
 
 impl TaperColumnSerializeHandler {
@@ -389,6 +392,8 @@ impl TaperColumnSerializeHandler {
             map: TaperHashMap::with_capacity(initial_capacity), rc,
             col_descs: columns.to_vec(), col_offsets, agg_offset,
             varchar_col_indices, varchar_slot_col_idx, use_merged, varchar_col_descs, varchar_slot_col_offset,
+            groups: Vec::new(),
+            update_indices: Vec::new(),
         }
     }
 
@@ -400,18 +405,21 @@ impl TaperColumnSerializeHandler {
         let n = hashes.len();
         if n == 0 { return; }
 
-        let mut groups: Vec<*const u8> = vec![std::ptr::null(); n];
-        let mut update_indices: Vec<u32> = Vec::new();
+        // Reuse buffers (mirrors C++ class members: resize without dealloc if already big enough)
+        self.groups.resize(n, std::ptr::null());
+        for p in self.groups.iter_mut() { *p = std::ptr::null(); }
+        self.update_indices.clear();
 
         // Step 2+3
         let rc_ptr = &mut self.rc as *mut RowContainer;
-        let col_offsets = self.col_offsets.clone();
-        let col_descs_clone = self.col_descs.clone();
-        let varchar_col_indices_clone = self.varchar_col_indices.clone();
+        let col_offsets = &self.col_offsets;
+        let col_descs = &self.col_descs;
+        let varchar_col_indices = &self.varchar_col_indices;
         let varchar_slot_col_idx = self.varchar_slot_col_idx;
         let use_merged = self.use_merged;
         let agg_offset = self.agg_offset;
-        let groups_ptr = groups.as_mut_ptr();
+        let groups_ptr = self.groups.as_mut_ptr();
+        let update_indices_ptr = &mut self.update_indices as *mut Vec<u32>;
 
         self.map.emplace_batch_full(
             hashes,
@@ -419,21 +427,21 @@ impl TaperColumnSerializeHandler {
             &mut |i: usize, sv: &mut SlotValue| {
                 let rc = unsafe { &mut *rc_ptr };
                 let row = rc.new_row();
-                store_key_one_row_from_decode(rc, row, i, columns, &col_descs_clone, &col_offsets, &varchar_col_indices_clone, varchar_slot_col_idx, use_merged);
+                store_key_one_row_from_decode(rc, row, i, columns, col_descs, col_offsets, varchar_col_indices, varchar_slot_col_idx, use_merged);
                 unsafe { RowContainer::store_value::<i64>(row, agg_offset, agg_values[i]); *groups_ptr.add(i) = row as *const u8; }
                 sv.set_ptr(row as *const u8);
             },
             &mut |i: usize, sv: &SlotValue, is_new: bool| {
-                if !is_new { unsafe { *groups_ptr.add(i) = sv.get_ptr(); } update_indices.push(i as u32); }
+                if !is_new { unsafe { *groups_ptr.add(i) = sv.get_ptr(); (*update_indices_ptr).push(i as u32); } }
             },
         );
 
         // Step 4
-        let count = update_indices.len();
+        let count = self.update_indices.len();
         if count == 0 { return; }
-        let mut working_indices = update_indices;
+        let mut working_indices = std::mem::take(&mut self.update_indices);
         let idx_from = get_unequals_num_with_decode(
-            &mut working_indices, count, columns, &groups,
+            &mut working_indices, count, columns, &self.groups,
             &self.col_descs, &self.col_offsets, &self.varchar_col_indices,
             self.use_merged, self.varchar_slot_col_offset, &self.varchar_col_descs,
         );
@@ -467,8 +475,10 @@ impl TaperColumnSerializeHandler {
         // Accumulate agg for equal rows
         for ui in idx_from..count {
             let row_idx = working_indices[ui] as usize;
-            let rp = groups[row_idx] as *mut u8;
+            let rp = self.groups[row_idx] as *mut u8;
             unsafe { *(rp.add(self.agg_offset) as *mut i64) += agg_values[row_idx]; }
         }
+        // Return working_indices buffer for reuse
+        self.update_indices = working_indices;
     }
 }
