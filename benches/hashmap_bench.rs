@@ -23,6 +23,8 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use taper_hashmap::column_marshaller::{TaperColumnSerializeHandler, ColumnDesc, ColumnInput};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
+use arrow::array::{ArrayRef, Array, Int64Array, StringArray};
+use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════════════════
 // Daft infra
@@ -197,28 +199,81 @@ fn run_taper_mixed(data: &MixedBenchData, ht_size: usize) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Daft runners
+// Daft runners — uses real Arrow arrays to match Daft's actual code path
 // ═══════════════════════════════════════════════════════════════════
 
+/// Build a multi-column equality comparator from Arrow arrays.
+/// This mirrors Daft's `build_multi_array_is_equal` in comparison.rs:
+///   - Box<dyn Fn(usize, usize) -> bool> outer closure
+///   - Per-column: downcast ArrayRef → typed access with offset indirection
+///   - Validity bitmap check for nulls
+fn build_multi_array_is_equal(arrays: &[ArrayRef]) -> Box<dyn Fn(usize, usize) -> bool + '_> {
+    // Build per-column comparators as closures (matches Daft's pattern)
+    let col_comparators: Vec<Box<dyn Fn(usize, usize) -> bool + '_>> = arrays.iter().map(|arr| {
+        let arr_ref: &dyn arrow::array::Array = arr.as_ref();
+        if let Some(str_arr) = arr_ref.as_any().downcast_ref::<StringArray>() {
+            // String column: validity check + offset-based value access
+            let comparator: Box<dyn Fn(usize, usize) -> bool + '_> = Box::new(move |i: usize, j: usize| {
+                let i_null = str_arr.is_null(i);
+                let j_null = str_arr.is_null(j);
+                if i_null && j_null { return true; }
+                if i_null || j_null { return false; }
+                // value() does offset lookup: offsets[i]..offsets[i+1] into data buffer
+                str_arr.value(i) == str_arr.value(j)
+            });
+            comparator
+        } else if let Some(int_arr) = arr_ref.as_any().downcast_ref::<Int64Array>() {
+            // Int64 column: validity check + direct value access
+            let comparator: Box<dyn Fn(usize, usize) -> bool + '_> = Box::new(move |i: usize, j: usize| {
+                let i_null = int_arr.is_null(i);
+                let j_null = int_arr.is_null(j);
+                if i_null && j_null { return true; }
+                if i_null || j_null { return false; }
+                int_arr.value(i) == int_arr.value(j)
+            });
+            comparator
+        } else {
+            panic!("unsupported array type");
+        }
+    }).collect();
+
+    Box::new(move |i: usize, j: usize| -> bool {
+        for cmp in col_comparators.iter() {
+            if !cmp(i, j) { return false; }
+        }
+        true
+    })
+}
+
+/// Convert MixedBenchData into Arrow arrays (done outside timing loop).
+fn build_arrow_arrays(data: &MixedBenchData) -> Vec<ArrayRef> {
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+    for c in 0..data.num_str_cols {
+        let arr = StringArray::from_iter_values(
+            data.str_cols[c].iter().map(|s| unsafe { std::str::from_utf8_unchecked(s) })
+        );
+        arrays.push(Arc::new(arr) as ArrayRef);
+    }
+    for c in 0..data.num_int_cols {
+        let arr = Int64Array::from(data.int_cols[c].clone());
+        arrays.push(Arc::new(arr) as ArrayRef);
+    }
+    arrays
+}
+
 #[inline(never)]
-fn run_daft_mixed(data: &MixedBenchData, ht_size: usize) {
+fn run_daft_mixed(data: &MixedBenchData, ht_size: usize, arrays: &[ArrayRef]) {
     let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(ht_size, Default::default());
     let mut ngroups: u32 = 0;
     let mut sums = Vec::<i64>::with_capacity(ht_size);
-    let num_str = data.num_str_cols;
-    let num_int = data.num_int_cols;
+
+    // Build comparator from Arrow arrays — same as Daft's build_multi_array_is_equal
+    let comparator = build_multi_array_is_equal(arrays);
 
     for (i, &h) in data.hashes.iter().enumerate() {
-        let entry = table.raw_entry_mut().from_hash(h, |other| {
+        let entry: RawEntryMut<'_, IndexHash, u32, BuildHasherDefault<IdentityHasher>> = table.raw_entry_mut().from_hash(h, |other| {
             if h != other.hash { return false; }
-            let j = other.idx as usize;
-            for c in 0..num_str {
-                if data.str_cols[c][i] != data.str_cols[c][j] { return false; }
-            }
-            for c in 0..num_int {
-                if data.int_cols[c][i] != data.int_cols[c][j] { return false; }
-            }
-            true
+            comparator(i, other.idx as usize)
         });
         match entry {
             RawEntryMut::Occupied(e) => { sums[*e.get() as usize] += data.values[i]; }
@@ -256,9 +311,10 @@ fn bench_hashagg(c: &mut Criterion) {
                 for &selectivity in &[0.1, 0.3, 0.5, 0.7, 0.9] {
                     let mut rng = StdRng::seed_from_u64(42);
                     let data = generate_mixed_data(num_str, num_int, num_keys, num_probe_rows, selectivity, &mut rng);
+                    let arrays = build_arrow_arrays(&data);
                     let param = format!("{}_ht={}_lf={:.2}_sel={:.1}", type_name, ht_size, load_factor, selectivity);
 
-                    group.bench_with_input(BenchmarkId::new("daft", &param), &data, |b, d| { b.iter(|| run_daft_mixed(black_box(d), ht_size)); });
+                    group.bench_with_input(BenchmarkId::new("daft", &param), &data, |b, d| { b.iter(|| run_daft_mixed(black_box(d), ht_size, &arrays)); });
                     group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| { b.iter(|| run_taper_mixed(black_box(d), ht_size)); });
                 }
             }
