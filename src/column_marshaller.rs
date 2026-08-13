@@ -396,7 +396,7 @@ impl TaperColumnSerializeHandler {
 
         self.map.emplace_batch_full(
             hashes,
-            &|_: usize, _: &SlotValue| -> bool { false },
+            &|_: usize, _: &SlotValue| -> bool { true },
             &mut |i: usize, sv: &mut SlotValue| {
                 let rc = unsafe { &mut *rc_ptr };
                 let row = rc.new_row();
