@@ -74,9 +74,13 @@ struct MixedBenchData {
     num_int_cols: usize,
 }
 
-/// Generate random string of given average length
+/// Generate random string padded to 64 bytes
 fn gen_string(_rng: &mut StdRng, base: &str, id: usize, col: usize) -> Vec<u8> {
-    format!("{}_{}_c{}", base, id, col).into_bytes()
+    let s = format!("{}_{}_c{}", base, id, col);
+    let pad_len = 64usize.saturating_sub(s.len());
+    let mut out = s.into_bytes();
+    out.extend(std::iter::repeat(b'x').take(pad_len));
+    out
 }
 
 fn generate_mixed_data(
@@ -129,7 +133,10 @@ fn generate_mixed_data(
     for i in 0..num_misses {
         let mut h = 0u64;
         for c in 0..num_str_cols {
-            let s = format!("miss_{}_{}", i, c).into_bytes();
+            let base = format!("miss_{}_{}", i, c);
+            let pad_len = 64usize.saturating_sub(base.len());
+            let mut s = base.into_bytes();
+            s.extend(std::iter::repeat(b'x').take(pad_len));
             h = hash_bytes(&s, h);
             probe_str_cols[c].push(s);
         }
