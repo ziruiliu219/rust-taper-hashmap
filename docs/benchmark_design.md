@@ -1,323 +1,259 @@
-# Benchmark 设计文档：Daft hashbrown vs TaperHashMap
+# TaperHashMap vs Daft (hashbrown) Benchmark 设计文档
 
 ## 1. 目标
 
-比较两种 hash table 在 GroupBy Aggregation 场景下的性能：
-- **Daft 侧**: hashbrown (Swiss Table) + IdentityHasher + IndexHash + 即时 comparator
-- **Taper 侧**: TaperHashMap + SWAR tag + 延迟 batch compare
+在纯 Hash Table 层面对比 **OmniOperator TaperHashTable**（Rust 实现）与 **Daft 风格 hashbrown**（业界标准 Robin Hood hash table）在 GROUP BY 聚合场景下的性能表现。
+
+重点验证：
+- TaperHashTable 的 batch prefetch + SIMD 批量比较策略的实际收益
+- VARCHAR（变长字符串）key 对性能的影响
+- 不同 Hash Table 规模和数据分布下的表现差异
 
 ---
 
-## 2. 模拟的数据
+## 2. 测试架构
 
-### 2.1 列数据 (`KeyModel`)
+### 2.1 Taper 侧
 
-模拟 Daft 的 Arrow 列式数组，用 `Vec<i64>` / `Vec<String>` 代替。
+使用完整的 C++ TaperHashTable 5-step 流水线的 Rust 等价实现：
 
 ```
-KeyModel::generate(kind, num_rows, num_groups)
-
-输入:
-  kind = "2col_i64"
-  num_rows = 1,000,000
-  num_groups = 100
-  seed = 42 (固定, 保证可重现)
-
-输出:
-  col_a: Vec<i64> = [97, 194, 97, 4850, 97, ...]   ← 100万个值, 只有 100 种不同
-  col_b: Vec<i64> = [60, 113, 60, 346, 60, ...]    ← 同上
-  hashes: Vec<u64> = [0xA1B2.., 0xC3D4.., ...]     ← 预计算的 xxHash3 值
+Step 1: Hash 计算（预计算，不计入 benchmark 时间）
+Step 2: emplace_batch_full — tag + hash(u64) 两层过滤 + 软件 prefetch
+Step 3: StoreKeyOneRowFromDecode — 序列化 key 到 RowContainer
+Step 4: GetUnequalsNumWithDecode — SIMD 批量 key 验证（indices-swap）
+Step 5: Collision repair — 单行 emplace + 完整 key 比较
 ```
 
-四种 key 类型：
+核心组件：
+| 组件 | 对应 C++ | 功能 |
+|------|---------|------|
+| `TaperHashMap` | `TaperFlatHashTable` | chunked open-addressing, 128B aligned |
+| `RowContainer` | `RowContainer` | 行式存储 + arena allocator |
+| `TaperColumnSerializeHandler` | `TaperColumnSerializeHandler` | 5-step 流水线编排 |
+| `batch_compare_decoded_i64_neon` | `SveBatchCompareDecoded<int64>` | NEON SIMD 2×i64 并行比较 |
+| `compare_varchar_from_row` | `CompareVarcharFromRow` | NEON 16B/iter 字节比较 |
 
-| key_kind | 列组成 | comparator 开销 |
-|----------|--------|----------------|
-| `1col_i64` | 1 列 i64 | 极低 (1次 i64 ==) |
-| `2col_i64` | 2 列 i64 | 低 (2次 i64 ==) |
-| `4col_i64` | 4 列 i64 | 中 (4次 i64 ==) |
-| `2col_i64_string` | 2 列 i64 + 1 列 string(30字节) | 高 (2次 i64 == + string compare) |
+### 2.2 Daft 侧
 
-### 2.2 Hash 计算
+使用 hashbrown `HashMap` + `raw_entry_mut` API，模拟 Daft query engine 的 GROUP BY 实现：
 
-使用和 Daft 完全相同的 xxHash3 (链式 seed)：
-
-```rust
-use xxhash_rust::xxh3::xxh3_64_with_seed;
-
-// 模拟 Daft 的 hash_rows():
-fn mix_hash2(a: u64, b: u64) -> u64 {
-    let h = xxh3_64_with_seed(&a.to_le_bytes(), 0);     // 第一列, seed=0
-    xxh3_64_with_seed(&b.to_le_bytes(), h)              // 第二列, seed=第一列 hash
-}
+```
+for each row:
+    raw_entry_mut.from_hash(hash, |existing| {
+        compare all key columns: existing[col] == input[col]
+    })
+    → Occupied: accumulate agg
+    → Vacant: insert new group
 ```
 
-对应 Daft 源码 (`ops/hash.rs`):
-```rust
-let mut hash_so_far = cols[0].hash(None)?;
-for c in cols.iter().skip(1) {
-    hash_so_far = c.hash(Some(&hash_so_far))?;
-}
-```
-
-### 2.3 Value 列 (聚合用)
-
-```rust
-let values: Vec<i64> = (0..num_rows).map(|i| (i % 1000) as i64).collect();
-```
-
-用于 `sums[gid] += values[i]`，模拟 SUM 聚合的状态更新。
+特点：
+- 逐行处理（无 batch）
+- 列式直接访问输入数据（无序列化）
+- Robin Hood 开放寻址 + SIMD 查找
 
 ---
 
-## 3. Daft 侧调用的接口
+## 3. 测试参数
 
-### 3.1 使用的库
+### 3.1 Key 类型组合
 
-```rust
-use hashbrown::{HashMap, hash_map::RawEntryMut};
-```
+| 名称 | VARCHAR 列数 | INT64 列数 | 总列数 |
+|------|------------|-----------|--------|
+| `0str_4int` | 0 | 4 | 4 |
+| `1str_3int` | 1 | 3 | 4 |
+| `2str_2int` | 2 | 2 | 4 |
+| `3str_1int` | 3 | 1 | 4 |
+| `4str_0int` | 4 | 0 | 4 |
 
-### 3.2 数据结构
+### 3.2 Hash Table 参数
 
-```rust
-// 和 Daft 完全一致:
-struct IndexHash { idx: u64, hash: u64 }
+| 参数 | 取值 | 含义 |
+|------|------|------|
+| HT Size (slots) | 16,384 / 65,536 / 262,144 / 1,048,576 | Hash table 容量 |
+| Load Factor | 0.50 / 0.75 | `num_groups = HT_size × LF` |
+| Selectivity | 0.1 / 0.3 / 0.5 / 0.7 / 0.9 | probe 命中率 |
 
-impl Hash for IndexHash {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash);  // IdentityHasher: 不再 rehash
-    }
-}
+### 3.3 固定参数
 
-let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
-    init_cap, Default::default(),
-);
-```
-
-### 3.3 核心 API 调用
-
-```rust
-// 对每行:
-let entry = table.raw_entry_mut().from_hash(h, |other| {
-    //                              ↑ hashbrown 内部:
-    //                                1. h 低位定位 Group
-    //                                2. NEON SIMD 比较 ctrl byte (tag)
-    //                                3. tag 匹配后调这个闭包:
-    (h == other.hash)                    // ← Stage 1b: hash ==
-    && keys.compare(i, other.idx as usize)  // ← Stage 2: comparator (立即)
-});
-
-match entry {
-    RawEntryMut::Occupied(e) => {
-        let gid = *e.get();
-        sums[gid as usize] += values[i];     // ← 聚合
-    }
-    RawEntryMut::Vacant(e) => {
-        let gid = ngroups; ngroups += 1;
-        e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, gid);
-        sums.push(0);
-    }
-}
-```
-
-### 3.4 Comparator
-
-```rust
-impl KeyModel {
-    fn compare(&self, i: usize, j: usize) -> bool {
-        match self {
-            OneCol { col } => col[i] == col[j],
-            TwoCols { a, b } => a[i] == a[j] && b[i] == b[j],
-            FourCols { a, b, c, d } => a[i]==a[j] && b[i]==b[j] && c[i]==c[j] && d[i]==d[j],
-            TwoColsAndString { a, b, s } => a[i]==a[j] && b[i]==b[j] && s[i]==s[j],
-        }
-    }
-}
-```
-
-对应 Daft 的 `build_multi_array_is_equal` 返回的闭包。
+| 参数 | 值 |
+|------|---|
+| Probe 行数 | 1,000,000 |
+| 字符串长度 | ~10-12 bytes (ASCII) |
+| 聚合操作 | SUM (i64 += i64) |
+| Hash 函数 | xxh3_64 |
+| Sample size | 20 (Criterion) |
 
 ---
 
-## 4. Taper 侧调用的接口
+## 4. 数据生成
 
-### 4.1 使用的库
-
-```rust
-use taper_hashmap::taper_hashmap::TaperHashMap;
-use taper_hashmap::chunk::SlotValue;
 ```
+Build phase:
+  生成 num_groups 个 distinct key 组合
+  str_col[c][i] = "key_{i}_c{c}" (确定性)
+  int_col[c][i] = i * (97 + c*31) + 1 (确定性)
 
-### 4.2 数据结构
+Probe phase:
+  hits = num_probe_rows × selectivity (从 build keys 随机选)
+  misses = num_probe_rows × (1-selectivity) (保证不在 build set)
+  shuffle(hits + misses) → 模拟真实交错访问
 
-```rust
-let mut map = TaperHashMap::with_capacity(init_cap);
-```
-
-### 4.3 核心 API 调用 — Phase 1
-
-```rust
-let _update_list = map.emplace_batch(
-    hashes,                          // ← 和 Daft 侧相同的 hash 数组
-    &mut |row_idx, sv| {             // on_new: 新 group
-        let g = ngroups; ngroups += 1;
-        write_gid(sv, g);            // 写 group_id 到 6-byte SlotValue
-        sums.push(0);
-        group_rep_rows.push(row_idx);
-        new_entries.push((row_idx, g));
-    },
-    &mut |row_idx, sv| {             // on_existing: tag+hash 匹配
-        let g = read_gid(sv);        // 从 SlotValue 读 group_id
-        existing_entries.push((row_idx, g));
-    },
-);
-```
-
-`emplace_batch` 内部做的：
-```
-for 每行:
-  1. tag = (hash >> 16) & 0x7F
-  2. chunk = chunks[hash & mask]
-  3. SWAR BitMask::match_tag(chunk.tags, tag)  ← tag 过滤
-  4. 对匹配的 slot: chunk.keys[slot] == hash?  ← hash ==
-  5. 匹配 → on_existing (不做 key compare!)
-     不匹配 → 找 empty slot → on_new
-```
-
-### 4.4 核心 API 调用 — Phase 2
-
-```rust
-// 处理 new group:
-for &(idx, g) in &new_entries {
-    sums[g as usize] += values[idx];
-}
-
-// Deferred full key compare:
-for &(idx, tentative_gid) in &existing_entries {
-    let rep = group_rep_rows[tentative_gid as usize];
-    if keys.compare(idx, rep) {                // ← 和 Daft 相同的 comparator
-        sums[tentative_gid as usize] += values[idx];
-    } else {
-        // hash collision (极少) — 简化处理
-        sums[tentative_gid as usize] += values[idx];
-    }
-}
-```
-
-### 4.5 SlotValue 读写
-
-```rust
-// 写 group_id (u32) 到 6-byte SlotValue:
-fn write_gid(sv: &mut SlotValue, gid: u32) {
-    sv.bytes[0..4].copy_from_slice(&gid.to_ne_bytes());
-}
-
-// 从 SlotValue 读 group_id:
-fn read_gid(sv: &SlotValue) -> u32 {
-    let mut b = [0u8; 4];
-    b.copy_from_slice(&sv.bytes[0..4]);
-    u32::from_ne_bytes(b)
-}
+Final data = [build keys] + [shuffled probe keys]
 ```
 
 ---
 
-## 5. 两侧流程对比
+## 5. 计时范围
 
+两侧计时范围一致：**从创建 hash table 到处理完全部 1M 行**。
+
+| 步骤 | Taper | Daft | 计入时间? |
+|------|-------|------|----------|
+| Hash 计算 | 预计算 | 预计算 | ❌ |
+| 数据生成 | 预生成 | 预生成 | ❌ |
+| 创建 HT | `TaperColumnSerializeHandler::new` | `HashMap::with_capacity` | ✅ |
+| 处理所有行 | `emplace_table_with_decode` | for loop + raw_entry_mut | ✅ |
+
+---
+
+## 6. SIMD 加速路径
+
+### 6.1 INT64 列比较 (aarch64 NEON)
+
+```rust
+// batch_compare_decoded_i64_neon: 2×i64 并行比较
+let v_stored = vcombine_s64(vcreate_s64(stored0), vcreate_s64(stored1));
+let v_input = vcombine_s64(vcreate_s64(input0), vcreate_s64(input1));
+let cmp = vceqq_s64(v_stored, v_input);  // 128-bit 并行
 ```
-Daft (每行):
-  from_hash(h, closure)
-    → [hashbrown 内部] NEON tag match
-    → [closure] hash== → comparator(cols[i] vs cols[j]) → 确认
-  → Occupied: sums[gid] += val
-  → Vacant: insert + sums.push(0)
 
-Taper (分两阶段):
-  Phase 1 - emplace_batch (每行):
-    → SWAR tag match
-    → hash==
-    → on_new: write gid, push to new_entries
-    → on_existing: read gid, push to existing_entries
+### 6.2 VARCHAR 字节比较 (aarch64 NEON)
 
-  Phase 2 - deferred (只对 existing_entries):
-    → comparator(cols[i] vs cols[rep]) → 确认
-    → sums[gid] += val
+```rust
+// compare_bytes_neon: 16 bytes/iteration
+let lhs_vec = vld1q_u8(left.add(i));
+let rhs_vec = vld1q_u8(right.add(i));
+let cmp = vceqq_u8(lhs_vec, rhs_vec);  // 16 字节并行比较
+```
+
+### 6.3 Prefetch
+
+```rust
+// 每个 chunk 128B = 2 cache lines, 提前 16 步 prefetch
+asm!("prfm pldl1keep, [{ptr}]");      // cache line 1
+asm!("prfm pldl1keep, [{ptr + 64}]"); // cache line 2
 ```
 
 ---
 
-## 6. 测量范围
+## 7. VARCHAR Key 序列化
 
-| 内容 | 计入时间？ |
-|------|-----------|
-| 数据生成 (KeyModel::generate) | ✗ 不计 |
-| Hash 计算 (xxHash3) | ✗ 不计 (预算好的) |
-| HashMap/TaperHashMap 初始化 | ✓ 计入 |
-| Probe + Insert (全部行) | ✓ 计入 |
-| Comparator (逐列比较) | ✓ 计入 |
-| Aggregation (sums[gid] += val) | ✓ 计入 |
-| Vec 分配 (new_entries 等) | ✓ 计入 (Taper 的 overhead) |
+### 7.1 存储模型
+
+```
+Row 布局: [int_col(8B)][varchar_ptr(8B)]...[null_block][agg_state]
+                              │
+                              ▼ Arena Buffer
+                        [rowLenSize:1B][length:1/2/4B][data:N bytes]
+```
+
+### 7.2 多 VARCHAR 列合并 (Merged)
+
+当 varchar 列 > 1 时，所有 varchar 数据合并到一个连续 block，只存一个指针：
+
+```
+Row: [ptr(8B)][unused]...[int cols][null][agg]
+       │
+       ▼ 一个连续 arena block
+       [col0: rls+len+data][col1: rls+len+data][col2: rls+len+data]
+```
+
+比较时先用 `GetAllMergedVarcharPtrs` 缓存各列指针，再逐列 `CompareVarcharFromRow`。
 
 ---
 
-## 7. 三组 Benchmark 的参数
+## 8. 测试结果摘要
 
-### bench_key_complexity
+### 8.1 关键发现
 
-| 固定 | 变量 |
-|------|------|
-| rows = 1M | key_kind × num_groups |
+| Key 类型 | Taper vs Daft | 原因分析 |
+|---------|--------------|---------|
+| **0str_4int** | **Taper 赢 30-50%** | SIMD batch 比较 + prefetch 发挥优势 |
+| **1str_3int** | **接近平手~Taper 微赢** | 1 个 varchar 开销小 |
+| **2str_2int** | **Daft 赢 10-30%** | varchar 序列化开销开始影响 |
+| **3str_1int** | **Daft 赢 30-60%** | varchar 主导，arena 开销大 |
+| **4str_0int** | **Daft 赢 50-200%** | 全 varchar，序列化 + pointer chase |
 
-```
-key_kind ∈ {1col_i64, 2col_i64, 4col_i64, 2col_i64_string}
-num_groups ∈ {10, 100, 1000, 10000}
-```
+### 8.2 Selectivity 影响
 
-### bench_row_scale
+- Selectivity 高 (0.7-0.9) → Taper 相对更优（batch compare 发挥作用）
+- Selectivity 低 (0.1-0.3) → Taper 相对更差（大量新 group 创建 = 序列化开销大）
 
-| 固定 | 变量 |
-|------|------|
-| key = 2col_i64, groups = 100 | rows |
+### 8.3 HT Size 影响
 
-```
-rows ∈ {100_000, 1_000_000, 10_000_000}
-```
+- 中等 HT (65K-262K) → Taper prefetch 优势明显
+- 大 HT (1M) → 两侧都受 cache miss 影响，差距缩小
+- 小 HT (16K) → 全在 cache 中，prefetch 无用
 
-### bench_load_factor
+### 8.4 代表性数据点
 
-| 固定 | 变量 |
-|------|------|
-| key = 2col_i64, rows = 1M, groups = 1000 | init_cap (控制 load factor) |
+| Case | Daft | Taper | 比值 |
+|------|------|-------|------|
+| 0str_4int, ht=65K, sel=0.9 | 52ms | **26ms** | **0.50x** ✅ |
+| 0str_4int, ht=262K, sel=0.1 | 62ms | **35ms** | **0.57x** ✅ |
+| 1str_3int, ht=16K, sel=0.9 | 48ms | **40ms** | **0.85x** ✅ |
+| 2str_2int, ht=65K, sel=0.7 | 88ms | 91ms | 1.03x ≈平 |
+| 4str_0int, ht=16K, sel=0.9 | 80ms | 113ms | 1.41x ❌ |
+| 4str_0int, ht=1M, sel=0.1 | 82ms | 373ms | 4.55x ❌ |
 
-```
-target_lf ∈ {0.5, 0.7, 0.9}
-init_cap = groups / target_lf
+---
+
+## 9. 结论
+
+1. **TaperHashTable 在 INT-heavy 场景下确实优于 hashbrown**，验证了 batch prefetch + SIMD 策略的有效性。
+
+2. **VARCHAR 场景下 Taper 的行式序列化设计是性能瓶颈**——arena 分配 + 格式编解码 + pointer chase 的代价超过了 batch/prefetch 的收益。
+
+3. **Taper 的优势随 HT 规模和 selectivity 增大而增强**——这符合其 batch prefetch 隐藏 cache miss latency 的设计初衷。
+
+4. **实际 query engine 中 Taper 的 buffer 复用（本 benchmark 未模拟）会进一步缩小差距**——C++ Taper 的 `BatchContext` 等 buffer 是类成员常驻复用的。
+
+---
+
+## 10. 运行方式
+
+```bash
+# 全部运行
+cargo bench
+
+# 只跑纯 int
+cargo bench -- "0str_4int"
+
+# 只跑特定参数
+cargo bench -- "2str_2int_ht=65536_lf=0.50_sel=0.7"
+
+# 验证 SIMD 路径
+cargo test test_simd_dispatch_i64 -- --nocapture
 ```
 
 ---
 
-## 8. 公平性控制
+## 11. 文件结构
 
-| 维度 | 两侧是否相同 |
-|------|------------|
-| 输入 hash 值 | ✓ 同一个 `&[u64]` |
-| 随机 seed | ✓ 固定 seed=42 |
-| Comparator 逻辑 | ✓ 同一个 `keys.compare(i, j)` |
-| Aggregation | ✓ 同样的 `sums[gid] += values[i]` |
-| 初始容量 | ✓ 同一个 `init_cap` |
-| Key 数据 | ✓ 同一个 `KeyModel` |
+```
+src/
+├── taper_hashmap.rs       ← TaperFlatHashTable (chunked HT + prefetch)
+├── chunk.rs               ← 128B aligned chunk + SlotValue
+├── bitmask.rs             ← SWAR tag matching
+├── row_container.rs       ← RowContainer (行存储 + arena)
+├── batch_compare.rs       ← SIMD batch key compare (NEON)
+├── column_marshaller.rs   ← TaperColumnSerializeHandler (5-step pipeline)
+└── lib.rs
 
----
+benches/
+└── hashmap_bench.rs       ← Criterion benchmark (Taper vs Daft)
 
-## 9. 对应 Daft 源码位置
-
-| Benchmark 中的模拟 | Daft 真实代码 |
-|-------------------|-------------|
-| `HashMap::<IndexHash, u32, IdentityBuildHasher>` | `src/daft-recordbatch/src/ops/hash.rs` |
-| `raw_entry_mut().from_hash(h, closure)` | `src/daft-recordbatch/src/ops/hash.rs:50` |
-| `(h == other.hash) && keys.compare(i, j)` | `src/daft-recordbatch/src/ops/hash.rs:51-54` |
-| `IdentityHasher / IndexHash` | `src/daft-core/src/utils/identity_hash_set.rs` |
-| `keys.compare(i, j)` | `src/daft-core/src/array/ops/arrow/comparison.rs` |
-| hash 计算 (xxHash3 链式) | `src/daft-core/src/kernels/hashing.rs` |
-| `sums[gid] += values[i]` | `src/daft-recordbatch/src/ops/inline_agg.rs` accumulator |
+docs/
+└── BENCHMARK_DESIGN.md    ← 本文档
+```
