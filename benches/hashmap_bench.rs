@@ -302,6 +302,7 @@ fn bench_hashagg(c: &mut Criterion) {
         ("3str_1int", 3, 1),
         ("2str_2int", 2, 2),
         ("1str_3int", 1, 3),
+        ("0str_4int", 0, 4),
     ];
 
     for &(type_name, num_str, num_int) in mixed_key_types {
