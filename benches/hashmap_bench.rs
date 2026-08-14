@@ -74,9 +74,18 @@ struct MixedBenchData {
     num_int_cols: usize,
 }
 
-/// Generate random string of given average length (8~13 bytes)
+/// Generate string of ~120-150 bytes (simulates real SQL varchar: addresses, URLs, descriptions)
 fn gen_string(_rng: &mut StdRng, base: &str, id: usize, col: usize) -> Vec<u8> {
-    format!("{}_{}_c{}", base, id, col).into_bytes()
+    // Pad to ~128 bytes with deterministic content
+    let prefix = format!("{}_{}_c{}_", base, id, col);
+    let padding = "abcdefghijklmnopqrstuvwxyz0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let target_len = 128;
+    let mut s = prefix;
+    while s.len() < target_len {
+        s.push_str(padding);
+    }
+    s.truncate(target_len);
+    s.into_bytes()
 }
 
 fn generate_mixed_data(
@@ -129,7 +138,11 @@ fn generate_mixed_data(
     for i in 0..num_misses {
         let mut h = 0u64;
         for c in 0..num_str_cols {
-            let s = format!("miss_{}_{}", i, c).into_bytes();
+            let mut s = format!("miss_{}_{}_", i, c);
+            let padding = "ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210_zyxwvutsrqponmlkjihgfedcba";
+            while s.len() < 128 { s.push_str(padding); }
+            s.truncate(128);
+            let s = s.into_bytes();
             h = hash_bytes(&s, h);
             probe_str_cols[c].push(s);
         }
