@@ -262,23 +262,39 @@ fn build_arrow_arrays(data: &MixedBenchData) -> Vec<ArrayRef> {
 }
 
 #[inline(never)]
-fn run_daft_mixed(data: &MixedBenchData, ht_size: usize, arrays: &[ArrayRef]) {
+fn run_daft_mixed(data: &MixedBenchData, ht_size: usize, _arrays: &[ArrayRef]) {
+    // Fair Daft: stores OWNED key data per group (simulating batch memory recycle).
+    // In a real query engine, input batch memory is freed after processing,
+    // so the hash table must own its key data — same as Taper's RowContainer.
     let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(ht_size, Default::default());
     let mut ngroups: u32 = 0;
     let mut sums = Vec::<i64>::with_capacity(ht_size);
-
-    // Build comparator from Arrow arrays — same as Daft's build_multi_array_is_equal
-    let comparator = build_multi_array_is_equal(arrays);
+    // Owned key storage per group (simulates what a real engine must do)
+    let num_str = data.num_str_cols;
+    let num_int = data.num_int_cols;
+    let mut group_str_keys: Vec<Vec<Vec<u8>>> = vec![Vec::with_capacity(ht_size); num_str];
+    let mut group_int_keys: Vec<Vec<i64>> = vec![Vec::with_capacity(ht_size); num_int];
 
     for (i, &h) in data.hashes.iter().enumerate() {
-        let entry: RawEntryMut<'_, IndexHash, u32, BuildHasherDefault<IdentityHasher>> = table.raw_entry_mut().from_hash(h, |other| {
+        let entry = table.raw_entry_mut().from_hash(h, |other| {
             if h != other.hash { return false; }
-            comparator(i, other.idx as usize)
+            let j = other.idx as usize;
+            // Compare against OWNED group data (not input arrays)
+            for c in 0..num_str {
+                if group_str_keys[c][j] != data.str_cols[c][i] { return false; }
+            }
+            for c in 0..num_int {
+                if group_int_keys[c][j] != data.int_cols[c][i] { return false; }
+            }
+            true
         });
         match entry {
             RawEntryMut::Occupied(e) => { sums[*e.get() as usize] += data.values[i]; }
             RawEntryMut::Vacant(e) => {
-                e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, ngroups);
+                // Must COPY key data into owned storage (like Taper's serialize)
+                for c in 0..num_str { group_str_keys[c].push(data.str_cols[c][i].clone()); }
+                for c in 0..num_int { group_int_keys[c].push(data.int_cols[c][i]); }
+                e.insert_hashed_nocheck(h, IndexHash { idx: ngroups as u64, hash: h }, ngroups);
                 ngroups += 1; sums.push(data.values[i]);
             }
         }
