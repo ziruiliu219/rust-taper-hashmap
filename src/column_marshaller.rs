@@ -362,6 +362,10 @@ pub struct TaperColumnSerializeHandler {
     use_merged: bool,
     varchar_col_descs: Vec<(usize, u8)>,
     varchar_slot_col_offset: usize,
+    // Reusable buffers (mirrors C++ class members)
+    groups: Vec<*const u8>,
+    update_indices: Vec<u32>,
+    merged_cache: Vec<*const u8>,
 }
 
 impl TaperColumnSerializeHandler {
@@ -389,6 +393,7 @@ impl TaperColumnSerializeHandler {
             map: TaperHashMap::with_capacity(initial_capacity), rc,
             col_descs: columns.to_vec(), col_offsets, agg_offset,
             varchar_col_indices, varchar_slot_col_idx, use_merged, varchar_col_descs, varchar_slot_col_offset,
+            groups: Vec::new(), update_indices: Vec::new(), merged_cache: Vec::new(),
         }
     }
 
@@ -400,18 +405,21 @@ impl TaperColumnSerializeHandler {
         let n = hashes.len();
         if n == 0 { return; }
 
-        let mut groups: Vec<*const u8> = vec![std::ptr::null(); n];
-        let mut update_indices: Vec<u32> = Vec::new();
+        // Reuse buffers (mirrors C++ class member resize pattern)
+        self.groups.resize(n, std::ptr::null());
+        unsafe { std::ptr::write_bytes(self.groups.as_mut_ptr(), 0, n); }
+        self.update_indices.clear();
 
         // Step 2+3
         let rc_ptr = &mut self.rc as *mut RowContainer;
-        let col_offsets = self.col_offsets.clone();
-        let col_descs_clone = self.col_descs.clone();
-        let varchar_col_indices_clone = self.varchar_col_indices.clone();
+        let col_offsets = &self.col_offsets as *const Vec<usize>;
+        let col_descs = &self.col_descs as *const Vec<ColumnDesc>;
+        let varchar_col_indices = &self.varchar_col_indices as *const Vec<usize>;
         let varchar_slot_col_idx = self.varchar_slot_col_idx;
         let use_merged = self.use_merged;
         let agg_offset = self.agg_offset;
-        let groups_ptr = groups.as_mut_ptr();
+        let groups_ptr = self.groups.as_mut_ptr();
+        let update_indices_ptr = &mut self.update_indices as *mut Vec<u32>;
 
         self.map.emplace_batch_full(
             hashes,
@@ -419,24 +427,55 @@ impl TaperColumnSerializeHandler {
             &mut |i: usize, sv: &mut SlotValue| {
                 let rc = unsafe { &mut *rc_ptr };
                 let row = rc.new_row();
-                store_key_one_row_from_decode(rc, row, i, columns, &col_descs_clone, &col_offsets, &varchar_col_indices_clone, varchar_slot_col_idx, use_merged);
-                unsafe { RowContainer::store_value::<i64>(row, agg_offset, agg_values[i]); *groups_ptr.add(i) = row as *const u8; }
+                unsafe {
+                    store_key_one_row_from_decode(rc, row, i, columns, &*col_descs, &*col_offsets, &*varchar_col_indices, varchar_slot_col_idx, use_merged);
+                    RowContainer::store_value::<i64>(row, agg_offset, agg_values[i]);
+                    *groups_ptr.add(i) = row as *const u8;
+                }
                 sv.set_ptr(row as *const u8);
             },
             &mut |i: usize, sv: &SlotValue, is_new: bool| {
-                if !is_new { unsafe { *groups_ptr.add(i) = sv.get_ptr(); } update_indices.push(i as u32); }
+                if !is_new { unsafe { *groups_ptr.add(i) = sv.get_ptr(); (*update_indices_ptr).push(i as u32); } }
             },
         );
 
         // Step 4
-        let count = update_indices.len();
+        let count = self.update_indices.len();
         if count == 0 { return; }
-        let mut working_indices = update_indices;
-        let idx_from = get_unequals_num_with_decode(
-            &mut working_indices, count, columns, &groups,
-            &self.col_descs, &self.col_offsets, &self.varchar_col_indices,
-            self.use_merged, self.varchar_slot_col_offset, &self.varchar_col_descs,
-        );
+        let mut working_indices = std::mem::take(&mut self.update_indices);
+        let num_varchar = self.varchar_col_indices.len();
+        if self.use_merged && num_varchar > 0 {
+            let max_idx = *working_indices[..count].iter().max().unwrap_or(&0) as usize;
+            let cache_size = (max_idx + 1) * num_varchar;
+            self.merged_cache.resize(cache_size, std::ptr::null());
+            unsafe { std::ptr::write_bytes(self.merged_cache.as_mut_ptr(), 0, cache_size); }
+            let mut out_ptrs = vec![std::ptr::null::<u8>(); num_varchar];
+            for wi in 0..count {
+                let idx = working_indices[wi] as usize;
+                get_all_merged_varchar_ptrs(self.groups[idx], self.varchar_slot_col_offset, &self.varchar_col_descs, &mut out_ptrs);
+                for vc in 0..num_varchar { self.merged_cache[idx * num_varchar + vc] = out_ptrs[vc]; }
+            }
+        }
+        let mut idx_from = 0usize;
+        for (col_idx, desc) in self.col_descs.iter().enumerate() {
+            if idx_from >= count { break; }
+            let remaining = count - idx_from;
+            match desc {
+                ColumnDesc::Int64 => {
+                    let input = match &columns[col_idx] { ColumnInput::Int64(v) => *v, _ => panic!("") };
+                    idx_from += batch_compare_decoded_i64(&mut working_indices[idx_from..], remaining, input, &self.groups, self.col_offsets[col_idx]);
+                }
+                ColumnDesc::Varchar => {
+                    let input = match &columns[col_idx] { ColumnInput::Varchar(v) => *v, _ => panic!("") };
+                    if self.use_merged && num_varchar > 1 {
+                        let vc_pos = self.varchar_col_indices.iter().position(|&c| c == col_idx).unwrap();
+                        idx_from += batch_compare_varchar_decoded_cached(&mut working_indices[idx_from..], remaining, input, &self.merged_cache, num_varchar, vc_pos);
+                    } else {
+                        idx_from += batch_compare_varchar_decoded(&mut working_indices[idx_from..], remaining, input, &self.groups, self.col_offsets[col_idx]);
+                    }
+                }
+            }
+        }
 
         // Step 5
         for ui in 0..idx_from {
@@ -449,7 +488,6 @@ impl TaperColumnSerializeHandler {
             let merged = self.use_merged;
             let agg_off = self.agg_offset;
             let rc_ptr2 = &mut self.rc as *mut RowContainer;
-
             let key_cmp = |sv: &SlotValue| -> bool { compare_keys_with_decode(sv.get_ptr(), row_idx, columns, col_descs_ref, col_offsets_ref) };
             let mut on_init = |sv: &mut SlotValue| {
                 let rc = unsafe { &mut *rc_ptr2 };
@@ -467,8 +505,9 @@ impl TaperColumnSerializeHandler {
         // Accumulate agg for equal rows
         for ui in idx_from..count {
             let row_idx = working_indices[ui] as usize;
-            let rp = groups[row_idx] as *mut u8;
+            let rp = self.groups[row_idx] as *mut u8;
             unsafe { *(rp.add(self.agg_offset) as *mut i64) += agg_values[row_idx]; }
         }
+        self.update_indices = working_indices;
     }
 }
