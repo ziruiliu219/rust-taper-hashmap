@@ -202,9 +202,9 @@ pub fn batch_compare_decoded_i32(
     }
 }
 
-/// SVE SIMD implementation for aarch64 (compare up to VL/64 rows in parallel).
-/// Mirrors C++ `SveBatchCompareDecoded<int64_t>`.
-/// Requires nightly + feature "sve" + Kunpeng 920 hardware.
+/// SVE SIMD implementation for aarch64 Kunpeng 920.
+/// Uses SVE gather load + predicated compare (matches C++ SveBatchCompareNoNullDecoded<int64_t>).
+/// Requires nightly + feature "sve".
 #[cfg(all(target_arch = "aarch64", feature = "sve"))]
 pub fn batch_compare_decoded_i64_sve(
     indices: &mut [u32],
@@ -218,51 +218,56 @@ pub fn batch_compare_decoded_i64_sve(
 
     let mut idx_from = 0;
     let mut i = 0;
-    let vl = unsafe { svcntd() } as usize; // number of i64 elements per SVE register
 
-    while i + vl <= count {
-        unsafe {
-            let pg = svwhilelt_b64(i as i64, (i + vl) as i64);
+    unsafe {
+        let pg_all = svptrue_b64();
 
-            // Gather stored values from rows
-            let mut stored_arr = [0i64; 16]; // max VL=2048bit → 32 elements, 16 is safe for 256bit
-            for k in 0..vl {
-                let idx = indices[i + k] as usize;
-                stored_arr[k] = RowContainer::read_value::<i64>(groups[idx], offset);
+        while i < count {
+            // Predicate for remaining elements
+            let pg = svwhilelt_b64_s64(i as i64, count as i64);
+            let active_count = svcntp_b64(pg_all, pg) as usize;
+
+            // Load indices (zero-extend u32 → u64)
+            let v_idx = svld1uw_u64(pg, indices.as_ptr().add(i) as *const u32);
+
+            // Compute row pointer addresses: groups[idx] (gather from pointer array)
+            let v_ptr_offsets = svlsl_n_u64_x(pg, v_idx, 3); // idx * 8 (sizeof pointer)
+            let v_row_ptrs = svld1_gather_u64offset_u64(pg, groups.as_ptr() as *const u64, v_ptr_offsets);
+
+            // Compute value addresses: row_ptr + offset
+            let v_value_addr = svadd_n_u64_x(pg, v_row_ptrs, offset as u64);
+
+            // Gather stored i64 values from row pointers
+            let v_row_values = svld1_gather_u64base_s64(pg, v_value_addr);
+
+            // Gather input i64 values: input_values[idx]
+            let v_input_offsets = svlsl_n_u64_x(pg, v_idx, 3); // idx * 8
+            let v_input_values = svld1_gather_u64offset_s64(pg, input_values.as_ptr(), v_input_offsets);
+
+            // Compare: stored == input
+            let v_match = svcmpeq_s64(pg, v_row_values, v_input_values);
+
+            // Check if all match (fast path)
+            let v_not_match = svnot_b_z(pg, v_match);
+            if !svptest_any(pg, v_not_match) {
+                i += active_count;
+                continue;
             }
-            let v_stored = svld1_s64(pg, stored_arr.as_ptr());
 
-            // Gather input values
-            let mut input_arr = [0i64; 16];
-            for k in 0..vl {
-                let idx = indices[i + k] as usize;
-                input_arr[k] = input_values[idx];
-            }
-            let v_input = svld1_s64(pg, input_arr.as_ptr());
+            // Extract match results to scalar and swap unequals to front
+            let v_match_flag = svsel_u64(v_match, svdup_n_u64(1), svdup_n_u64(0));
+            let mut match_flags = [0u64; 32]; // max VL=2048 → 32 elements
+            svst1_u64(pg, match_flags.as_mut_ptr(), v_match_flag);
 
-            // Compare
-            let cmp = svceq_s64(pg, v_stored, v_input);
-
-            // Process results
-            for k in 0..vl {
-                if !svptest_lane(pg, cmp, k as u32) {
-                    indices.swap(i + k, idx_from);
+            for j in 0..active_count {
+                if match_flags[j] == 0 {
+                    indices.swap(i + j, idx_from);
                     idx_from += 1;
                 }
             }
-        }
-        i += vl;
-    }
 
-    // Scalar tail
-    while i < count {
-        let idx = indices[i] as usize;
-        let stored: i64 = RowContainer::read_value::<i64>(groups[idx], offset);
-        if stored != input_values[idx] {
-            indices.swap(i, idx_from);
-            idx_from += 1;
+            i += active_count;
         }
-        i += 1;
     }
 
     idx_from
