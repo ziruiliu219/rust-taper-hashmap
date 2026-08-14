@@ -5,6 +5,10 @@ edition = "2021"
 
 [workspace]
 
+[features]
+default = []
+sve = []  # Enable SVE SIMD on aarch64 (requires nightly + Kunpeng 920)
+
 [dependencies]
 
 [dev-dependencies]

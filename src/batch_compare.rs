@@ -202,6 +202,72 @@ pub fn batch_compare_decoded_i32(
     }
 }
 
+/// SVE SIMD implementation for aarch64 (compare up to VL/64 rows in parallel).
+/// Mirrors C++ `SveBatchCompareDecoded<int64_t>`.
+/// Requires nightly + feature "sve" + Kunpeng 920 hardware.
+#[cfg(all(target_arch = "aarch64", feature = "sve"))]
+pub fn batch_compare_decoded_i64_sve(
+    indices: &mut [u32],
+    count: usize,
+    input_values: &[i64],
+    groups: &[*const u8],
+    offset: usize,
+) -> usize {
+    use std::arch::aarch64::*;
+    use crate::row_container::RowContainer;
+
+    let mut idx_from = 0;
+    let mut i = 0;
+    let vl = unsafe { svcntd() } as usize; // number of i64 elements per SVE register
+
+    while i + vl <= count {
+        unsafe {
+            let pg = svwhilelt_b64(i as i64, (i + vl) as i64);
+
+            // Gather stored values from rows
+            let mut stored_arr = [0i64; 16]; // max VL=2048bit → 32 elements, 16 is safe for 256bit
+            for k in 0..vl {
+                let idx = indices[i + k] as usize;
+                stored_arr[k] = RowContainer::read_value::<i64>(groups[idx], offset);
+            }
+            let v_stored = svld1_s64(pg, stored_arr.as_ptr());
+
+            // Gather input values
+            let mut input_arr = [0i64; 16];
+            for k in 0..vl {
+                let idx = indices[i + k] as usize;
+                input_arr[k] = input_values[idx];
+            }
+            let v_input = svld1_s64(pg, input_arr.as_ptr());
+
+            // Compare
+            let cmp = svceq_s64(pg, v_stored, v_input);
+
+            // Process results
+            for k in 0..vl {
+                if !svptest_lane(pg, cmp, k as u32) {
+                    indices.swap(i + k, idx_from);
+                    idx_from += 1;
+                }
+            }
+        }
+        i += vl;
+    }
+
+    // Scalar tail
+    while i < count {
+        let idx = indices[i] as usize;
+        let stored: i64 = RowContainer::read_value::<i64>(groups[idx], offset);
+        if stored != input_values[idx] {
+            indices.swap(i, idx_from);
+            idx_from += 1;
+        }
+        i += 1;
+    }
+
+    idx_from
+}
+
 /// Dispatch to best available implementation.
 pub fn batch_compare_decoded_i64(
     indices: &mut [u32],
@@ -210,7 +276,13 @@ pub fn batch_compare_decoded_i64(
     groups: &[*const u8],
     offset: usize,
 ) -> usize {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "sve"))]
+    {
+        #[cfg(debug_assertions)]
+        eprintln!("[SIMD] batch_compare_decoded_i64: using SVE (svceq_s64, VL/64 i64/iter)");
+        batch_compare_decoded_i64_sve(indices, count, input_values, groups, offset)
+    }
+    #[cfg(all(target_arch = "aarch64", not(feature = "sve")))]
     {
         #[cfg(debug_assertions)]
         eprintln!("[SIMD] batch_compare_decoded_i64: using NEON (vceqq_s64, 2×i64/iter)");
